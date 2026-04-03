@@ -11,6 +11,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _run_attention_in_module_dtype(attn_module, query, key, value):
+    target_dtype = getattr(attn_module.in_proj_weight, "dtype", query.dtype)
+    output_dtype = query.dtype
+    if query.dtype != target_dtype:
+        query = query.to(dtype=target_dtype)
+    if key.dtype != target_dtype:
+        key = key.to(dtype=target_dtype)
+    if value.dtype != target_dtype:
+        value = value.to(dtype=target_dtype)
+    attn_out, attn_weights = attn_module(query, key, value)
+    if attn_out.dtype != output_dtype:
+        attn_out = attn_out.to(dtype=output_dtype)
+    return attn_out, attn_weights
+
+
 class TrajectoryReadoutMLP(nn.Module):
     def __init__(
         self,
@@ -75,7 +90,7 @@ class TrajectoryReadoutMLP(nn.Module):
         B, T, N, d = x.shape
         x = x.view(B * T, N, d)
         q = self.token_query.expand(B * T, -1, -1)
-        y, _ = self.token_attn(q, x, x)
+        y, _ = _run_attention_in_module_dtype(self.token_attn, q, x, x)
         y = y.squeeze(1)
         y = y.view(B, T, d)
         return y

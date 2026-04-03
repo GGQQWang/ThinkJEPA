@@ -716,8 +716,9 @@ def build_egodex_dataloaders(
             dl_kwargs["prefetch_factor"] = prefetch_factor
 
     if train_manifest and test_manifest:
-        train_files = _load_path_manifest_file(str(train_manifest), str(dataset_path))
-        test_files = _load_path_manifest_file(str(test_manifest), str(dataset_path))
+        manifest_dataset_path = None if use_npz_cache else str(dataset_path)
+        train_files = _load_path_manifest_file(str(train_manifest), manifest_dataset_path)
+        test_files = _load_path_manifest_file(str(test_manifest), manifest_dataset_path)
         dataset_roots = _expand_roots_for_sidecar_lookup(dataset_path)
 
         if use_npz_cache:

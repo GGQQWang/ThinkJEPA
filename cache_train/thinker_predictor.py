@@ -392,6 +392,15 @@ class CortexGuidedVideoPredictor(nn.Module):
         else:
             layer_count = len(self.guidance_fusion_mlps)
 
+        def _select_mask_layer(mask_bank, layer_index):
+            if mask_bank is None:
+                return None
+            if mask_bank.dim() == 1:
+                return mask_bank.to(dtype=torch.bool)
+            if layer_index < mask_bank.size(0):
+                return mask_bank[layer_index].to(dtype=torch.bool)
+            return mask_bank[-1].to(dtype=torch.bool)
+
         layer_payloads = []
         for layer_index in range(layer_count):
             old_tokens = self._project_guidance_layer(
@@ -400,8 +409,8 @@ class CortexGuidedVideoPredictor(nn.Module):
             new_tokens = self._project_guidance_layer(
                 new_stream, layer_index, self.guidance_new_adapter
             )
-            old_mask_layer = None if old_mask is None else old_mask[layer_index].to(dtype=torch.bool)
-            new_mask_layer = None if new_mask is None else new_mask[layer_index].to(dtype=torch.bool)
+            old_mask_layer = _select_mask_layer(old_mask, layer_index)
+            new_mask_layer = _select_mask_layer(new_mask, layer_index)
             if self.guidance_mode == "crossattn":
                 memory_tokens = self._build_cross_attention_memory(
                     old_tokens, new_tokens, old_mask_layer, new_mask_layer, device

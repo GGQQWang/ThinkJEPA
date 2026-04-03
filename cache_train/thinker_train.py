@@ -1696,8 +1696,14 @@ def render_bimanual_rollout_panel(
         # cam_int is either (3,3) or (T,3,3) and has no batch dimension
 
     # ====== Scale camera intrinsics to the current canvas resolution ======
-    cam_int_np = cam_int.detach().cpu().numpy()
-    K = cam_int_np[0] if cam_int_np.ndim == 3 else cam_int_np  # (3,3)
+    cam_int_np = np.asarray(cam_int.detach().cpu().numpy())
+    K = cam_int_np
+    while K.ndim > 2:
+        K = K[0]
+    if K.shape != (3, 3):
+        raise ValueError(
+            f"Expected camera intrinsics to reduce to shape (3, 3), got {cam_int_np.shape}"
+        )
     K = K.astype(np.float32).copy()
 
     # Estimate canvas resolution using one frame from one sample

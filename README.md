@@ -177,7 +177,12 @@ We provide a prepared cache release on Hugging Face:
 
 - https://huggingface.co/datasets/haichaozhang/cache
 
-This is the recommended path for reproducing the released ThinkJEPA setup without rebuilding Qwen3-VL features locally.
+This is the recommended path for reproducing the released ThinkJEPA setup without rebuilding Qwen3-VL features locally. The released scripts accept either:
+
+- a remote Hugging Face reference such as `hf://datasets/haichaozhang/cache/part2`, or
+- a local Hugging Face snapshot/cache path that already points to the downloaded `part2` tree.
+
+### Option A1: Use The Remote Hugging Face Reference
 
 ```bash
 HF_HOME=<HF_HOME> \
@@ -188,6 +193,49 @@ TEST_MANIFEST=hf://datasets/haichaozhang/cache/egodex_part2_video_cache_subset20
 VJEPA2_ROOT=$PWD/vjepa2 \
 bash scripts/train.sh
 ```
+
+### Option A2: Use A Local Hugging Face Snapshot Path
+
+If you have already downloaded the released cache, you can point the scripts directly at the local snapshot directory instead of using `hf://...` references.
+
+Minimal example:
+
+```bash
+LOCAL_CACHE_ROOT=<LOCAL_HF_SNAPSHOT>/part2
+
+DATA_DIR=${LOCAL_CACHE_ROOT} \
+CACHE_DIR=${LOCAL_CACHE_ROOT} \
+VJEPA2_ROOT=$PWD/vjepa2 \
+bash scripts/train.sh
+```
+
+If you want to use explicit train/test manifests, you can pass them as well:
+
+```bash
+LOCAL_CACHE_ROOT=<LOCAL_HF_SNAPSHOT>/part2
+
+DATA_DIR=${LOCAL_CACHE_ROOT} \
+CACHE_DIR=${LOCAL_CACHE_ROOT} \
+TRAIN_MANIFEST=<OPTIONAL_LOCAL_MANIFEST> \
+TEST_MANIFEST=<OPTIONAL_LOCAL_MANIFEST> \
+VJEPA2_ROOT=$PWD/vjepa2 \
+bash scripts/train.sh
+```
+
+The same local-path form also works for evaluation:
+
+```bash
+LOCAL_CACHE_ROOT=<LOCAL_HF_SNAPSHOT>/part2
+
+DATA_DIR=${LOCAL_CACHE_ROOT} \
+CACHE_DIR=${LOCAL_CACHE_ROOT} \
+TRAIN_MANIFEST=<OPTIONAL_LOCAL_MANIFEST> \
+TEST_MANIFEST=<OPTIONAL_LOCAL_MANIFEST> \
+VJEPA2_ROOT=$PWD/vjepa2 \
+bash scripts/eval_main.sh
+```
+
+On our side, we smoke-tested the public release with a local Hugging Face snapshot path in addition to the `hf://...` path.
 
 ### Option B: Download Raw EgoDex And Build Cache Locally
 
@@ -263,6 +311,106 @@ python cache_train/build_video_cache_splits.py \
 
 ## Training
 
+The most reliable public-release training path is to invoke `cache_train/thinker_train.py` directly so you can pass `--no_preload_cache_to_memory` explicitly.
+
+`train_batch_size` and `test_batch_size` are **per-GPU** batch sizes.
+
+### Single-GPU Training
+
+```bash
+cd /home/wang.yixuan/project/charles/thinkjepa
+conda activate qwen3vl
+
+export VJEPA2_ROOT=$PWD/vjepa2
+export PYTHONPATH=$PWD:$PWD/cache_train:$PWD/vjepa2:$(dirname "$PWD/vjepa2"):$PYTHONPATH
+
+LOCAL_CACHE_ROOT=<LOCAL_HF_SNAPSHOT>/part2
+
+python cache_train/thinker_train.py \
+  --data_dir "${LOCAL_CACHE_ROOT}" \
+  --cache_dir "${LOCAL_CACHE_ROOT}" \
+  --output_dir "$PWD/outputs/full_train_run_single" \
+  --results_md "$PWD/outputs/full_train_run_single/test_results.md" \
+  --output_mp4 "$PWD/outputs/full_train_run_single/vis/pred" \
+  --epochs 50 \
+  --predictor thinkjepa \
+  --backbone vjepa \
+  --optimize_together_downstream \
+  --seed 42 \
+  --train_ratio 0.9 \
+  --split_seed 42 \
+  --train_batch_size 16 \
+  --test_batch_size 16 \
+  --num_workers 4 \
+  --prefetch_factor 1 \
+  --past_T 32 \
+  --future_T 32 \
+  --temporal_stride 1 \
+  --camera_mode auto \
+  --thinkjepa_vlm_source both \
+  --thinkjepa_vlm_layer_selector last \
+  --thinkjepa_vlm_cond_mode film \
+  --lr 1e-3 \
+  --lr_pred 1e-4 \
+  --max_visual_batches 1 \
+  --use_npz_cache \
+  --skip_vjepa \
+  --no_preload_cache_to_memory
+```
+
+### Multi-GPU Training
+
+The example below uses 4 GPUs with batch size `16` per GPU, so the effective global train batch is `64`.
+
+```bash
+cd /home/wang.yixuan/project/charles/thinkjepa
+conda activate qwen3vl
+
+export VJEPA2_ROOT=$PWD/vjepa2
+export PYTHONPATH=$PWD:$PWD/cache_train:$PWD/vjepa2:$(dirname "$PWD/vjepa2"):$PYTHONPATH
+
+LOCAL_CACHE_ROOT=<LOCAL_HF_SNAPSHOT>/part2
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 cache_train/thinker_train.py \
+  --data_dir "${LOCAL_CACHE_ROOT}" \
+  --cache_dir "${LOCAL_CACHE_ROOT}" \
+  --output_dir "$PWD/outputs/full_train_run_4gpu" \
+  --results_md "$PWD/outputs/full_train_run_4gpu/test_results.md" \
+  --output_mp4 "$PWD/outputs/full_train_run_4gpu/vis/pred" \
+  --epochs 50 \
+  --predictor thinkjepa \
+  --backbone vjepa \
+  --optimize_together_downstream \
+  --seed 42 \
+  --train_ratio 0.9 \
+  --split_seed 42 \
+  --train_batch_size 16 \
+  --test_batch_size 16 \
+  --num_workers 4 \
+  --prefetch_factor 1 \
+  --past_T 32 \
+  --future_T 32 \
+  --temporal_stride 1 \
+  --camera_mode auto \
+  --thinkjepa_vlm_source both \
+  --thinkjepa_vlm_layer_selector last \
+  --thinkjepa_vlm_cond_mode film \
+  --lr 1e-3 \
+  --lr_pred 1e-4 \
+  --max_visual_batches 1 \
+  --use_npz_cache \
+  --skip_vjepa \
+  --no_preload_cache_to_memory \
+  --ddp
+```
+
+`DATA_DIR` and `CACHE_DIR` can still be either:
+
+- `hf://datasets/haichaozhang/cache/part2`
+- an absolute local Hugging Face snapshot path such as `<LOCAL_HF_SNAPSHOT>/part2`
+
+If you prefer the lightweight wrapper, `scripts/train.sh` is still available:
+
 ```bash
 DATA_DIR=<DATA_ROOT_OR_HF_SPEC> \
 CACHE_DIR=<CACHE_ROOT_OR_HF_SPEC> \
@@ -271,6 +419,11 @@ TEST_MANIFEST=<TEST_MANIFEST_OPTIONAL> \
 VJEPA2_ROOT=$PWD/vjepa2 \
 bash scripts/train.sh
 ```
+
+For the public release, we smoke-tested training with both:
+
+- the remote Hugging Face form `hf://datasets/haichaozhang/cache/part2`
+- a local Hugging Face snapshot path under `~/.cache/huggingface/.../part2`
 
 ## Evaluation
 
@@ -282,6 +435,13 @@ TEST_MANIFEST=<TEST_MANIFEST_OPTIONAL> \
 VJEPA2_ROOT=$PWD/vjepa2 \
 bash scripts/eval_main.sh
 ```
+
+The same two path forms are supported for evaluation:
+
+- `hf://datasets/haichaozhang/cache/part2`
+- an absolute local Hugging Face snapshot path such as `<LOCAL_HF_SNAPSHOT>/part2`
+
+For the public release, we also smoke-tested `scripts/eval_main.sh` with both path forms above.
 
 ## Third-Party Sources
 

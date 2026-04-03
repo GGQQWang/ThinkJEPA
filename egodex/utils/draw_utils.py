@@ -128,20 +128,27 @@ def _project_point_to_image_plane(point3d, intrinsic):
       - multiple points: (T, 2)
     """
     pt = np.asarray(point3d, dtype=np.float32)
-    rvec = np.zeros((3, 1), dtype=np.float32)
-    tvec = np.zeros((3, 1), dtype=np.float32)
+    K = np.asarray(intrinsic, dtype=np.float32)
+    if K.shape != (3, 3):
+        raise ValueError(f"intrinsic must be (3,3), got {K.shape}")
+
+    fx = float(K[0, 0])
+    fy = float(K[1, 1])
+    cx = float(K[0, 2])
+    cy = float(K[1, 2])
+
+    def _project_rows(rows):
+        z = rows[:, 2:3]
+        safe_z = np.where(np.abs(z) < 1e-6, np.nan, z)
+        x_img = fx * (rows[:, 0:1] / safe_z) + cx
+        y_img = fy * (rows[:, 1:2] / safe_z) + cy
+        return np.concatenate([x_img, y_img], axis=1)
 
     if pt.ndim == 1:  # (3,)
-        pt = pt.reshape(1, 1, 3)
-        img_pt, _ = cv2.projectPoints(pt, rvec, tvec, intrinsic, distCoeffs=None)
-        return img_pt.reshape(2)  # (2,)
+        return _project_rows(pt.reshape(1, 3)).reshape(2)
 
     elif pt.ndim == 2:  # (T,3)
-        T = pt.shape[0]
-        pt = pt.reshape(T, 1, 3)
-        img_pt, _ = cv2.projectPoints(pt, rvec, tvec, intrinsic, distCoeffs=None)
-        # img_pt: (T,1,2)
-        return img_pt.reshape(T, 2)  # (T,2)
+        return _project_rows(pt)
 
     else:
         raise ValueError(f"point3d with ndim={pt.ndim} not supported")
