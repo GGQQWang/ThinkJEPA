@@ -1,6 +1,6 @@
 app: vjepa_droid
 cpus_per_task: 12
-folder: /u/yli8/haichaozhang/ckpt/vjepa2/droid/4.8.vitg16-256px-8f
+folder: /path/to/vjepa2/checkpoints/droid/4.8.vitg16-256px-8f
 mem_per_gpu: 220G
 nodes: 4
 tasks_per_node: 8

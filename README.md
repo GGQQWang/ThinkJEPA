@@ -318,20 +318,21 @@ The most reliable public-release training path is to invoke `cache_train/thinker
 ### Single-GPU Training
 
 ```bash
-cd /home/wang.yixuan/project/charles/thinkjepa
+PROJECT_ROOT=/path/to/thinkjepa
+cd "${PROJECT_ROOT}"
 conda activate qwen3vl
 
-export VJEPA2_ROOT=$PWD/vjepa2
-export PYTHONPATH=$PWD:$PWD/cache_train:$PWD/vjepa2:$(dirname "$PWD/vjepa2"):$PYTHONPATH
+export VJEPA2_ROOT="${PROJECT_ROOT}/vjepa2"
+export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/cache_train:${PROJECT_ROOT}/vjepa2:$(dirname "${PROJECT_ROOT}/vjepa2"):${PYTHONPATH}"
 
 LOCAL_CACHE_ROOT=<LOCAL_HF_SNAPSHOT>/part2
 
 python cache_train/thinker_train.py \
   --data_dir "${LOCAL_CACHE_ROOT}" \
   --cache_dir "${LOCAL_CACHE_ROOT}" \
-  --output_dir "$PWD/outputs/full_train_run_single" \
-  --results_md "$PWD/outputs/full_train_run_single/test_results.md" \
-  --output_mp4 "$PWD/outputs/full_train_run_single/vis/pred" \
+  --output_dir "${PROJECT_ROOT}/outputs/full_train_run_single" \
+  --results_md "${PROJECT_ROOT}/outputs/full_train_run_single/test_results.md" \
+  --output_mp4 "${PROJECT_ROOT}/outputs/full_train_run_single/vis/pred" \
   --epochs 50 \
   --predictor thinkjepa \
   --backbone vjepa \
@@ -363,21 +364,24 @@ python cache_train/thinker_train.py \
 The example below uses 4 GPUs with batch size `16` per GPU, so the effective global train batch is `64`.
 
 ```bash
-cd /home/wang.yixuan/project/charles/thinkjepa
+PROJECT_ROOT=/path/to/thinkjepa
+cd "${PROJECT_ROOT}"
 conda activate qwen3vl
 
-export VJEPA2_ROOT=$PWD/vjepa2
-export PYTHONPATH=$PWD:$PWD/cache_train:$PWD/vjepa2:$(dirname "$PWD/vjepa2"):$PYTHONPATH
+export VJEPA2_ROOT="${PROJECT_ROOT}/vjepa2"
+export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/cache_train:${PROJECT_ROOT}/vjepa2:$(dirname "${PROJECT_ROOT}/vjepa2"):${PYTHONPATH}"
+export NCCL_NVLS_ENABLE=0
 
 LOCAL_CACHE_ROOT=<LOCAL_HF_SNAPSHOT>/part2
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 cache_train/thinker_train.py \
   --data_dir "${LOCAL_CACHE_ROOT}" \
   --cache_dir "${LOCAL_CACHE_ROOT}" \
-  --output_dir "$PWD/outputs/full_train_run_4gpu" \
-  --results_md "$PWD/outputs/full_train_run_4gpu/test_results.md" \
-  --output_mp4 "$PWD/outputs/full_train_run_4gpu/vis/pred" \
-  --epochs 50 \
+  --output_dir "${PROJECT_ROOT}/outputs/full_train_run_4gpu_bs16" \
+  --results_md "${PROJECT_ROOT}/outputs/full_train_run_4gpu_bs16/test_results.md" \
+  --output_mp4 "${PROJECT_ROOT}/outputs/full_train_run_4gpu_bs16/vis/pred" \
+  --epochs 500 \
+  --auto_resume \
   --predictor thinkjepa \
   --backbone vjepa \
   --optimize_together_downstream \

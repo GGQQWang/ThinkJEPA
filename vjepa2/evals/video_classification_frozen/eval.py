@@ -273,7 +273,7 @@ def main(args_eval, resume_preempt=False):
         step_logger = None
 
     # ---- dataloaders ----
-    cache_root = "/u/yli8/haichaozhang/cache/egodex/vjepa2"
+    cache_root = os.environ.get("VJEPA2_CACHE_ROOT", "/path/to/vjepa2/cache")
 
     if use_cached:
         # 从缓存读取，不需要 transforms/随机性

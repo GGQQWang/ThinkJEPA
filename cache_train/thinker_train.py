@@ -411,6 +411,7 @@ def save_training_checkpoint(
         payload["scaler"] = scaler.state_dict()
     if args is not None:
         payload["args"] = vars(args)
+        payload["target_epochs"] = int(getattr(args, "epochs", epoch))
     tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
     last_ex = None
     for attempt in range(3):
@@ -443,9 +444,32 @@ def parse_checkpoint_epoch_from_path(path):
     return int(m.group(1)) if m else -1
 
 
+def cleanup_legacy_epoch_checkpoints(out_dir, *, keep_paths=()):
+    out_dir = Path(out_dir)
+    keep = {Path(p).resolve() for p in keep_paths}
+    for ckpt_path in out_dir.glob("ckpt_epoch*.pt"):
+        try:
+            if ckpt_path.resolve() in keep:
+                continue
+            ckpt_path.unlink()
+        except FileNotFoundError:
+            continue
+        except Exception as ex:
+            rank = int(os.environ.get("RANK", "0"))
+            if rank == 0:
+                print(
+                    f"[WARN] failed to remove legacy checkpoint {ckpt_path}: {ex}",
+                    flush=True,
+                )
+
+
 def find_latest_valid_checkpoint(out_dir):
     out_dir = Path(out_dir)
-    candidates = list(out_dir.glob("ckpt_epoch*.pt"))
+    latest_path = out_dir / "ckpt_latest.pt"
+    candidates = []
+    if latest_path.exists():
+        candidates.append(latest_path)
+    candidates.extend(out_dir.glob("ckpt_epoch*.pt"))
     if not candidates:
         return None
     candidates.sort(key=lambda p: (parse_checkpoint_epoch_from_path(p), p.name), reverse=True)
@@ -3280,11 +3304,11 @@ def main(args):
                 )
             )
 
-        ckpt_path = out_dir / f"ckpt_epoch{epoch+1:03d}.pt"
+        latest_path = out_dir / "ckpt_latest.pt"
         if is_primary_process(rank):
             try:
                 save_training_checkpoint(
-                    ckpt_path,
+                    latest_path,
                     epoch + 1,
                     cls_model,
                     optimizer,
@@ -3295,9 +3319,10 @@ def main(args):
                     scaler=scaler,
                     args=args,
                 )
+                cleanup_legacy_epoch_checkpoints(out_dir)
             except Exception as ex:
                 print(
-                    f"[WARN] failed to save epoch checkpoint {ckpt_path}: {ex}",
+                    f"[WARN] failed to save latest checkpoint {latest_path}: {ex}",
                     flush=True,
                 )
 
@@ -3372,7 +3397,7 @@ def main(args):
                     "val_avg_dist": avg_test_avgdist,
                     "val_final_dist": avg_test_finaldist,
                     "time_sec": dt,
-                    "ckpt": str(ckpt_path),
+                    "ckpt": str(latest_path),
                     "is_best": is_best,
                 }
             )
@@ -3381,6 +3406,23 @@ def main(args):
             except Exception as ex:
                 print(
                     f"[WARN] failed to save metrics json {metrics_json_path}: {ex}",
+                    flush=True,
+                )
+            try:
+                write_json_atomic(
+                    {
+                        "current_epoch": epoch + 1,
+                        "target_epochs": int(num_epoch),
+                        "latest_ckpt": str(latest_path),
+                        "best_epoch": int(best_epoch),
+                        "best_ckpt": str(out_dir / "ckpt_best.pt"),
+                    },
+                    out_dir / "training_state.json",
+                )
+                write_text_file(f"{epoch + 1}\n", out_dir / "latest_epoch.txt")
+            except Exception as ex:
+                print(
+                    f"[WARN] failed to save training state under {out_dir}: {ex}",
                     flush=True,
                 )
         if ddp:
@@ -3433,7 +3475,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--auto_resume",
         action="store_true",
-        help="resume from the latest ckpt_epoch*.pt under --output_dir before continuing to --epochs",
+        help="resume from ckpt_latest.pt under --output_dir, or fall back to the latest legacy ckpt_epoch*.pt, before continuing to --epochs",
     )
     parser.add_argument(
         "--resume_ckpt",
