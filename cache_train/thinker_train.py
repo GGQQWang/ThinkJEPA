@@ -183,6 +183,42 @@ def compute_predicted_latent_metrics(pred_latent, target_latent):
     }
 
 
+def compute_latent_anomaly_scores(pred_latent, target_latent, threshold: float):
+    pred_latent = pred_latent.float()
+    target_latent = target_latent.float()
+    per_token_dist = torch.linalg.norm(pred_latent - target_latent, dim=-1)
+    scores = per_token_dist.mean(dim=(1, 2))
+    anomalies = scores > float(threshold)
+    return scores, anomalies
+
+
+def compute_binary_roc_auc(scores, labels):
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    labels = np.asarray(labels, dtype=np.int32).reshape(-1)
+    finite = np.isfinite(scores)
+    scores = scores[finite]
+    labels = labels[finite]
+    labels = (labels > 0).astype(np.int32)
+    pos = int(labels.sum())
+    neg = int(labels.size - pos)
+    if pos == 0 or neg == 0:
+        return None
+
+    order = np.argsort(scores, kind="mergesort")
+    sorted_scores = scores[order]
+    ranks = np.empty(labels.size, dtype=np.float64)
+    i = 0
+    while i < labels.size:
+        j = i + 1
+        while j < labels.size and sorted_scores[j] == sorted_scores[i]:
+            j += 1
+        avg_rank = 0.5 * (i + 1 + j)
+        ranks[order[i:j]] = avg_rank
+        i = j
+    pos_rank_sum = float(ranks[labels == 1].sum())
+    return (pos_rank_sum - pos * (pos + 1) / 2.0) / float(pos * neg)
+
+
 def write_json_atomic(obj, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -632,6 +668,72 @@ def build_thinker_cache_index(cache_root: str):
         stem = _normalize_thinker_cache_stem(p)
         index.setdefault((rel_dir, stem), []).append(p)
     return index
+
+
+def _flatten_path_items(paths):
+    if paths is None:
+        return []
+    if isinstance(paths, (str, os.PathLike)):
+        return [os.fspath(paths)]
+    if isinstance(paths, np.ndarray):
+        return [str(x) for x in paths.reshape(-1).tolist()]
+    if isinstance(paths, (list, tuple)):
+        return [str(x) for x in paths]
+    try:
+        return [str(x) for x in list(paths)]
+    except TypeError:
+        return [str(paths)]
+
+
+def build_frame_gt_index(gt_root: str):
+    if not gt_root:
+        return {}
+    gt_root = resolve_egodex_data_reference(str(gt_root))
+    if not os.path.isdir(gt_root):
+        raise FileNotFoundError(f"--frame_gt_dir does not exist: {gt_root}")
+    index = {}
+    patterns = ("*.npy", "*.npz", "*.txt", "*.csv", "*.json")
+    for pattern in patterns:
+        for p in sorted(glob.glob(os.path.join(gt_root, "**", pattern), recursive=True)):
+            stem = _normalize_thinker_cache_stem(p)
+            index.setdefault(stem, p)
+    return index
+
+
+def load_frame_gt_array(label_path: str):
+    ext = os.path.splitext(label_path)[1].lower()
+    if ext == ".npy":
+        arr = np.load(label_path, allow_pickle=False)
+    elif ext == ".npz":
+        with np.load(label_path, allow_pickle=False) as z:
+            key = "labels" if "labels" in z else ("gt" if "gt" in z else z.files[0])
+            arr = z[key]
+    elif ext == ".json":
+        with open(label_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            obj = obj.get("labels", obj.get("gt", obj.get("frame_labels", [])))
+        arr = np.asarray(obj)
+    else:
+        try:
+            arr = np.loadtxt(label_path, delimiter=",")
+        except ValueError:
+            arr = np.loadtxt(label_path)
+    return (np.asarray(arr).reshape(-1) > 0).astype(np.int32)
+
+
+def load_frame_gt_for_paths(paths, frame_gt_index: dict, frame_gt_cache: dict):
+    labels = []
+    for p in _flatten_path_items(paths):
+        stem = _normalize_thinker_cache_stem(p)
+        label_path = frame_gt_index.get(stem)
+        if label_path is None:
+            labels.append(None)
+            continue
+        if label_path not in frame_gt_cache:
+            frame_gt_cache[label_path] = load_frame_gt_array(label_path)
+        labels.append(frame_gt_cache[label_path])
+    return labels
 
 
 def resolve_cache_preload_policy(args) -> bool:
@@ -1852,6 +1954,25 @@ def split_context_and_future_windows(T, past_T, future_T):
     return past_idx, fut_idx
 
 
+def build_sliding_latent_windows(T, past_T, future_T, stride):
+    past_T = int(past_T)
+    future_T = int(future_T)
+    stride = max(1, int(stride))
+    if past_T <= 0 or future_T <= 0:
+        return []
+    last_start = int(T) - past_T - future_T
+    if last_start < 0:
+        return []
+    windows = []
+    for start in range(0, last_start + 1, stride):
+        p0 = start
+        p1 = start + past_T
+        f0 = p1
+        f1 = p1 + future_T
+        windows.append(((p0, p1), (f0, f1)))
+    return windows
+
+
 def stride_time_tensor(x, stride):
     if (x is None) or (not torch.is_tensor(x)) or int(stride) <= 1:
         return x
@@ -1883,6 +2004,77 @@ def repeat_indices_for_batch(idx_1d, B, device):
     return idx_1d.to(device).unsqueeze(0).repeat(B, 1)
 
 
+def forward_latent_predictor_window(
+    *,
+    predictor,
+    predictor_name: str,
+    feats_input_full: torch.Tensor,
+    feats_target_full: torch.Tensor,
+    p0: int,
+    p1: int,
+    f0: int,
+    f1: int,
+    args,
+    extras,
+    use_amp: bool,
+):
+    Tpred = f1 - f0
+    if Tpred <= 0:
+        zero = feats_input_full.new_zeros(())
+        return {
+            "pred_loss": zero,
+            "pred_latent_dist": zero,
+            "pred_latent_smooth_l1": zero,
+            "pred_latent_cosine_distance": zero,
+        }, None, None
+
+    if predictor_name == "tiny":
+        feats_ar_in = feats_input_full[:, p0:p1, ...].contiguous()
+        with build_amp_autocast(enabled=use_amp):
+            try:
+                pred_feats_past = predictor(feats_ar_in)
+            except TypeError:
+                pred_feats_past = predictor(
+                    feats_ar_in,
+                    attn_mask=build_future_causal_mask(
+                        feats_ar_in.shape[1], feats_ar_in.device
+                    ),
+                )
+            y_future = pred_feats_past[:, -Tpred:, ...].contiguous()
+            tgt_future = feats_target_full[:, f0:f1, ...].detach()
+            metrics = compute_predicted_latent_metrics(y_future, tgt_future)
+        return metrics, y_future, tgt_future
+
+    if predictor_name in {"official", "thinkjepa"}:
+        feats_total = feats_input_full[:, p0:f1, ...].contiguous()
+        B_, total_, P_, D_ = feats_total.shape
+        ctx_len = p1 - p0
+        x_seq = flatten_temporal_patch_tokens(feats_total)
+        idx_ctx_1d = build_temporal_patch_indices(P_, 0, ctx_len)
+        idx_tgt_1d = build_temporal_patch_indices(P_, ctx_len, ctx_len + Tpred)
+        masks_x = repeat_indices_for_batch(idx_ctx_1d.long(), B_, device=x_seq.device)
+        masks_y = repeat_indices_for_batch(idx_tgt_1d.long(), B_, device=x_seq.device)
+        x_ctxt = x_seq.gather(
+            dim=1, index=masks_x.unsqueeze(-1).expand(-1, -1, D_)
+        )
+        with build_amp_autocast(enabled=use_amp):
+            if predictor_name == "thinkjepa":
+                ext = build_thinkjepa_guidance_inputs(
+                    extras=extras,
+                    args=args,
+                    device=x_seq.device,
+                )
+                y_future_seq = predictor(x_ctxt, masks_x, masks_y, ext=ext)
+            else:
+                y_future_seq = predictor(x_ctxt, masks_x, masks_y)
+            y_future = y_future_seq.view(B_, Tpred, P_, D_)
+            tgt_future = feats_target_full[:, f0:f1, ...].detach()
+            metrics = compute_predicted_latent_metrics(y_future, tgt_future)
+        return metrics, y_future, tgt_future
+
+    raise ValueError(f"Unsupported latent predictor: {predictor_name}")
+
+
 def main(args):
     configure_huggingface_cache_dirs()
     args.data_dir = resolve_egodex_data_reference(str(args.data_dir))
@@ -1903,6 +2095,17 @@ def main(args):
     configure_reproducibility_seed(int(getattr(args, "seed", 42)))
     configure_dense_jepa_cudnn()
 
+    task = str(getattr(args, "task", "trajectory")).lower()
+    if task == "latent_anomaly" and getattr(args, "predictor", "none") == "none":
+        raise ValueError("--task latent_anomaly requires --predictor tiny|official|thinkjepa")
+    anomaly_stride = int(
+        getattr(args, "anomaly_stride", 0) or getattr(args, "future_T", 16)
+    )
+    anomaly_threshold = float(getattr(args, "anomaly_threshold", 1.0))
+    frame_gt_index = build_frame_gt_index(getattr(args, "frame_gt_dir", ""))
+    frame_gt_cache = {}
+    if is_primary_process(rank) and frame_gt_index:
+        print(f"[INFO] frame-level GT labels indexed: {len(frame_gt_index)} files")
     num_epoch = int(getattr(args, "epochs", 300))
     use_amp = (not getattr(args, "no_amp", False)) and device.type == "cuda"
     grad_accum_steps = int(getattr(args, "grad_accum", 1))
@@ -2171,6 +2374,8 @@ def main(args):
     if is_primary_process(rank):
         write_json_atomic(logs, metrics_json_path)
     best_ade = float(logs["best"]["ade"])
+    best_pred_loss = float(logs["best"].get("pred_loss", float("inf")))
+    best_epoch = int(logs["best"].get("epoch", -1))
 
     for epoch in range(start_epoch, num_epoch):
         if ddp and train_sampler is not None:
@@ -2494,6 +2699,129 @@ def main(args):
                             print(
                                 "[INFO] loaded predictor/optimizer_pred state from resume checkpoint"
                             )
+
+            if task == "latent_anomaly":
+                windows = build_sliding_latent_windows(
+                    Tall, args.past_T, args.future_T, anomaly_stride
+                )
+                if not windows:
+                    pbar.update(1)
+                    continue
+
+                window_metrics_sum = initialize_latent_metric_totals()
+                window_score_parts = []
+                window_anomaly_parts = []
+                valid_windows = 0
+                total_pred_loss = feats_teacher_full.new_zeros(())
+
+                for (wp0, wp1), (wf0, wf1) in windows:
+                    metrics_i, pred_future_i, target_future_i = forward_latent_predictor_window(
+                        predictor=predictor,
+                        predictor_name=args.predictor,
+                        feats_input_full=feats_teacher_full,
+                        feats_target_full=feats_gt_full,
+                        p0=wp0,
+                        p1=wp1,
+                        f0=wf0,
+                        f1=wf1,
+                        args=args,
+                        extras=extras,
+                        use_amp=use_amp,
+                    )
+                    total_pred_loss = total_pred_loss + metrics_i["pred_loss"]
+                    for key in window_metrics_sum:
+                        window_metrics_sum[key] += metrics_i[key]
+                    if pred_future_i is not None and target_future_i is not None:
+                        scores_i, anomalies_i = compute_latent_anomaly_scores(
+                            pred_future_i.detach(),
+                            target_future_i,
+                            threshold=anomaly_threshold,
+                        )
+                        window_score_parts.append(scores_i)
+                        window_anomaly_parts.append(anomalies_i.float())
+                    valid_windows += 1
+
+                pred_metrics = {
+                    key: val / max(valid_windows, 1)
+                    for key, val in window_metrics_sum.items()
+                }
+                anomaly_scores = (
+                    torch.cat(window_score_parts, dim=0)
+                    if window_score_parts
+                    else feats_teacher_full.new_zeros((1,))
+                )
+                anomaly_flags = (
+                    torch.cat(window_anomaly_parts, dim=0)
+                    if window_anomaly_parts
+                    else feats_teacher_full.new_zeros((1,))
+                )
+                anomaly_score = anomaly_scores.mean()
+                anomaly_rate = anomaly_flags.mean()
+                latent_loss = total_pred_loss / max(valid_windows, 1)
+
+                nonfinite_reasons = []
+                if not torch.isfinite(latent_loss).all():
+                    nonfinite_reasons.append(
+                        f"pred_loss={scalar_debug_string(latent_loss)}"
+                    )
+                any_nonfinite = _any_rank(int(bool(nonfinite_reasons)), ddp)
+                if any_nonfinite:
+                    batch_paths_msg = summarize_batch_paths(paths)
+                    if not getattr(args, "skip_nonfinite_loss", False):
+                        reason_str = ", ".join(nonfinite_reasons) if nonfinite_reasons else "another rank reported non-finite loss"
+                        path_str = f" paths={batch_paths_msg}" if batch_paths_msg else ""
+                        raise FloatingPointError(
+                            f"Non-finite latent loss at epoch={epoch+1} step={step}{path_str}: {reason_str}"
+                        )
+                    if optimizer_pred is not None:
+                        optimizer_pred.zero_grad(set_to_none=True)
+                    accum_steps = 0
+                    nonfinite_skip_count += 1
+                    pbar.update(1)
+                    continue
+
+                latent_loss_norm = latent_loss / max(grad_accum_steps, 1)
+                if use_amp:
+                    scaler.scale(latent_loss_norm).backward()
+                else:
+                    latent_loss_norm.backward()
+                display_loss = latent_loss.detach()
+                accum_steps += 1
+
+                train_loss_sum += float(display_loss.item())
+                train_acc_sum += float((1.0 - anomaly_rate).item())
+                train_avgdist_sum += float(anomaly_score.item())
+                train_finaldist_sum += float(anomaly_rate.item())
+                train_count += 1
+                for key in train_lat_metric_sums:
+                    train_lat_metric_sums[key] += float(pred_metrics[key].item())
+                train_pred_count += 1
+
+                if accum_steps >= max(grad_accum_steps, 1):
+                    if use_amp:
+                        if optimizer_pred is not None:
+                            scaler.step(optimizer_pred)
+                        scaler.update()
+                    else:
+                        if optimizer_pred is not None:
+                            optimizer_pred.step()
+                    if optimizer_pred is not None:
+                        optimizer_pred.zero_grad(set_to_none=True)
+                    accum_steps = 0
+
+                if step % 2 == 0:
+                    pbar.set_postfix(
+                        {
+                            "latent_loss": f"{float(display_loss.item()):.4f}",
+                            "pred_lat": f"{float(pred_metrics['pred_latent_dist'].item()):.4f}",
+                            "anom_score": f"{float(anomaly_score.item()):.4f}",
+                            "anom_rate": f"{float(anomaly_rate.item()):.3f}",
+                            "windows": valid_windows,
+                            "step": step,
+                        }
+                    )
+                pbar.update(1)
+                continue
 
             # ==== predictor forward (build pred_loss & feats_task_in) ====
             pred_metrics = {
@@ -2868,6 +3196,8 @@ def main(args):
         test_lat_metric_sums = initialize_latent_metric_totals()
         test_count = 0
         test_pred_count = 0
+        val_frame_auc_scores = []
+        val_frame_auc_labels = []
 
         with torch.no_grad():
             itr_test = iter(test_loader)
@@ -2992,6 +3322,105 @@ def main(args):
                     "pred_latent_cosine_distance": torch.tensor(0.0, device=device),
                 }
                 pred_metric_valid = False
+                if task == "latent_anomaly":
+                    windows = build_sliding_latent_windows(
+                        Tall, args.past_T, args.future_T, anomaly_stride
+                    )
+                    if not windows or not use_pred:
+                        continue
+
+                    window_metrics_sum = initialize_latent_metric_totals()
+                    window_score_parts = []
+                    window_anomaly_parts = []
+                    frame_score_sum = feats_eval_full.new_zeros((B, Tall))
+                    frame_score_count = feats_eval_full.new_zeros((B, Tall))
+                    valid_windows = 0
+                    for (wp0, wp1), (wf0, wf1) in windows:
+                        metrics_i, pred_future_i, target_future_i = forward_latent_predictor_window(
+                            predictor=predictor,
+                            predictor_name=args.predictor,
+                            feats_input_full=feats_eval_full,
+                            feats_target_full=feats_gt_full,
+                            p0=wp0,
+                            p1=wp1,
+                            f0=wf0,
+                            f1=wf1,
+                            args=args,
+                            extras=extras,
+                            use_amp=use_amp,
+                        )
+                        for key in window_metrics_sum:
+                            window_metrics_sum[key] += metrics_i[key]
+                        if pred_future_i is not None and target_future_i is not None:
+                            scores_i, anomalies_i = compute_latent_anomaly_scores(
+                                pred_future_i,
+                                target_future_i,
+                                threshold=anomaly_threshold,
+                            )
+                            window_score_parts.append(scores_i)
+                            window_anomaly_parts.append(anomalies_i.float())
+                            frame_score_sum[:, wf0:wf1] += scores_i[:, None]
+                            frame_score_count[:, wf0:wf1] += 1.0
+                        valid_windows += 1
+
+                    pred_metrics_eval = {
+                        key: val / max(valid_windows, 1)
+                        for key, val in window_metrics_sum.items()
+                    }
+                    anomaly_scores = (
+                        torch.cat(window_score_parts, dim=0)
+                        if window_score_parts
+                        else feats_eval_full.new_zeros((1,))
+                    )
+                    anomaly_flags = (
+                        torch.cat(window_anomaly_parts, dim=0)
+                        if window_anomaly_parts
+                        else feats_eval_full.new_zeros((1,))
+                    )
+                    anomaly_score = anomaly_scores.mean()
+                    anomaly_rate = anomaly_flags.mean()
+                    if frame_gt_index:
+                        frame_scores = frame_score_sum / frame_score_count.clamp_min(1.0)
+                        valid_frame_mask = frame_score_count > 0
+                        frame_gt_batch = load_frame_gt_for_paths(
+                            paths, frame_gt_index, frame_gt_cache
+                        )
+                        for sample_idx, frame_gt in enumerate(frame_gt_batch[:B]):
+                            if frame_gt is None:
+                                continue
+                            valid_len = min(int(Tall), int(frame_gt.shape[0]))
+                            if valid_len <= 0:
+                                continue
+                            mask_np = (
+                                valid_frame_mask[sample_idx, :valid_len]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .astype(bool)
+                            )
+                            if not mask_np.any():
+                                continue
+                            score_np = (
+                                frame_scores[sample_idx, :valid_len]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                            )
+                            val_frame_auc_scores.extend(score_np[mask_np].tolist())
+                            val_frame_auc_labels.extend(frame_gt[:valid_len][mask_np].tolist())
+
+                    test_loss_sum += float(pred_metrics_eval["pred_loss"].item())
+                    test_acc_sum += float((1.0 - anomaly_rate).item())
+                    test_avgdist_sum += float(anomaly_score.item())
+                    test_finaldist_sum += float(anomaly_rate.item())
+                    test_count += 1
+                    for key in test_lat_metric_sums:
+                        test_lat_metric_sums[key] += float(
+                            pred_metrics_eval[key].item()
+                        )
+                    test_pred_count += 1
+                    continue
+
                 if use_pred:
                     if args.predictor == "tiny":
                         feats_ar_in = feats_eval_full[:, p0:p1, ...].contiguous()
@@ -3244,6 +3673,11 @@ def main(args):
         avg_test_finaldist = distributed_mean_scalar(
             avg_test_finaldist, ddp=ddp, world_size=world_size
         )
+        val_frame_auc = (
+            compute_binary_roc_auc(val_frame_auc_scores, val_frame_auc_labels)
+            if task == "latent_anomaly" and val_frame_auc_scores
+            else None
+        )
 
         if is_primary_process(rank):
             train_pred_loss_str = (
@@ -3286,17 +3720,28 @@ def main(args):
                 if avg_test_lat_metrics["pred_latent_cosine_distance"] is not None
                 else "NA"
             )
+            val_frame_auc_str = (
+                f"{val_frame_auc:.4f}" if val_frame_auc is not None else "NA"
+            )
             print(
                 f"[Epoch {epoch+1:03d}] "
                 f"train_loss={avg_train_loss:.4f} acc={avg_train_acc:.4f} "
                 f"pred_loss={train_pred_loss_str} pred_latent_dist={train_pred_latent_str} "
                 f"pred_smooth_l1={train_pred_s1_str} pred_cos={train_pred_cos_str} "
-                f"avg_dist={avg_train_avgdist:.4f} final_dist={avg_train_finaldist:.4f} | "
-                f"val_loss={avg_test_loss:.4f} acc={avg_test_acc:.4f} "
+                + (
+                    f"anomaly_score={avg_train_avgdist:.4f} anomaly_rate={avg_train_finaldist:.4f} | "
+                    if task == "latent_anomaly"
+                    else f"avg_dist={avg_train_avgdist:.4f} final_dist={avg_train_finaldist:.4f} | "
+                )
+                + f"val_loss={avg_test_loss:.4f} acc={avg_test_acc:.4f} "
                 f"pred_loss={val_pred_loss_str} pred_latent_dist={val_pred_latent_str} "
                 f"pred_smooth_l1={val_pred_s1_str} pred_cos={val_pred_cos_str} "
-                f"avg_dist={avg_test_avgdist:.4f} final_dist={avg_test_finaldist:.4f} | "
-                f"time={dt:.1f}s"
+                + (
+                    f"anomaly_score={avg_test_avgdist:.4f} anomaly_rate={avg_test_finaldist:.4f} frame_auc={val_frame_auc_str} | "
+                    if task == "latent_anomaly"
+                    else f"avg_dist={avg_test_avgdist:.4f} final_dist={avg_test_finaldist:.4f} | "
+                )
+                + f"time={dt:.1f}s"
                 + (
                     f" skipped_nonfinite={int(nonfinite_skip_count)}"
                     if nonfinite_skip_count > 0
@@ -3326,14 +3771,27 @@ def main(args):
                     flush=True,
                 )
 
-        is_best = avg_test_avgdist < best_ade
+        if task == "latent_anomaly":
+            current_best_metric = (
+                float(avg_test_lat_metrics["pred_loss"])
+                if avg_test_lat_metrics["pred_loss"] is not None
+                else float("inf")
+            )
+            is_best = current_best_metric < best_pred_loss
+        else:
+            current_best_metric = avg_test_avgdist
+            is_best = current_best_metric < best_ade
         if is_primary_process(rank) and is_best:
-            best_ade = avg_test_avgdist
+            if task == "latent_anomaly":
+                best_pred_loss = current_best_metric
+            else:
+                best_ade = current_best_metric
             best_epoch = epoch + 1
             best_path = out_dir / "ckpt_best.pt"
             best_blob = {
                 "epoch": best_epoch,
-                "ade": best_ade,
+                "task": task,
+                "ade": avg_test_avgdist,
                 "loss": avg_test_loss,
                 "pred_loss": avg_test_lat_metrics["pred_loss"],
                 "pred_latent_dist": avg_test_lat_metrics["pred_latent_dist"],
@@ -3343,6 +3801,10 @@ def main(args):
                 "pred_latent_cosine_distance": avg_test_lat_metrics[
                     "pred_latent_cosine_distance"
                 ],
+                "anomaly_threshold": anomaly_threshold,
+                "anomaly_score": avg_test_avgdist,
+                "anomaly_rate": avg_test_finaldist,
+                "frame_auc": val_frame_auc,
                 "ckpt": str(best_path),
             }
             try:
@@ -3369,6 +3831,9 @@ def main(args):
             logs["epochs"].append(
                 {
                     "epoch": epoch + 1,
+                    "task": task,
+                    "anomaly_threshold": anomaly_threshold,
+                    "anomaly_stride": anomaly_stride,
                     "train_loss": avg_train_loss,
                     "train_pred_loss": avg_train_lat_metrics["pred_loss"],
                     "train_pred_latent_dist": avg_train_lat_metrics[
@@ -3384,6 +3849,8 @@ def main(args):
                     "train_acc": avg_train_acc,
                     "train_avg_dist": avg_train_avgdist,
                     "train_final_dist": avg_train_finaldist,
+                    "train_anomaly_score": avg_train_avgdist if task == "latent_anomaly" else None,
+                    "train_anomaly_rate": avg_train_finaldist if task == "latent_anomaly" else None,
                     "val_loss": avg_test_loss,
                     "val_pred_loss": avg_test_lat_metrics["pred_loss"],
                     "val_pred_latent_dist": avg_test_lat_metrics["pred_latent_dist"],
@@ -3396,6 +3863,10 @@ def main(args):
                     "val_acc": avg_test_acc,
                     "val_avg_dist": avg_test_avgdist,
                     "val_final_dist": avg_test_finaldist,
+                    "val_anomaly_score": avg_test_avgdist if task == "latent_anomaly" else None,
+                    "val_anomaly_rate": avg_test_finaldist if task == "latent_anomaly" else None,
+                    "val_frame_auc": val_frame_auc,
+                    "val_frame_auc_count": len(val_frame_auc_labels),
                     "time_sec": dt,
                     "ckpt": str(latest_path),
                     "is_best": is_best,
@@ -3526,6 +3997,31 @@ if __name__ == "__main__":
         default="none",
         choices=["none", "tiny", "official", "thinkjepa"],
         help="choose predictor head: none | tiny (paper) | official (V-JEPA predictor) | thinkjepa (cortex-guided ThinkJEPA rollout head)",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="trajectory",
+        choices=["trajectory", "latent_anomaly"],
+        help="training objective: trajectory keeps the original hand-trajectory head; latent_anomaly trains/evaluates future latent prediction over sliding windows",
+    )
+    parser.add_argument(
+        "--anomaly_stride",
+        type=int,
+        default=0,
+        help="sliding stride for --task latent_anomaly; default 0 means use --future_T",
+    )
+    parser.add_argument(
+        "--anomaly_threshold",
+        type=float,
+        default=1.0,
+        help="latent distance threshold for marking a sliding window prediction as anomalous",
+    )
+    parser.add_argument(
+        "--frame_gt_dir",
+        type=str,
+        default="",
+        help="optional directory with per-frame 0/1 GT labels for frame-level AUC; files are matched by sample stem and may be .npy/.npz/.txt/.csv/.json",
     )
 
     parser.add_argument("--optimize_together_downstream", action="store_true")
@@ -3830,6 +4326,12 @@ if __name__ == "__main__":
         raise ValueError(
             f"--temporal_stride must be positive, got {args.temporal_stride}"
         )
+    if int(args.anomaly_stride) < 0:
+        raise ValueError(
+            f"--anomaly_stride must be >= 0, got {args.anomaly_stride}"
+        )
+    if args.task == "latent_anomaly" and args.predictor == "none":
+        raise ValueError("--task latent_anomaly requires --predictor tiny|official|thinkjepa")
     if int(args.thinkjepa_think_drop_prefix_len) < 0:
         raise ValueError(
             f"--thinkjepa_think_drop_prefix_len must be >= 0, got {args.thinkjepa_think_drop_prefix_len}"
