@@ -126,7 +126,7 @@ def read_video_clip(video_path: str, num_frames: int, decode_size: int):
         raise RuntimeError(f"Empty video: {video_path}")
     idx = uniform_frame_indices(total, num_frames)
     frames = vr.get_batch(idx).asnumpy()
-    return frames.astype(np.uint8, copy=False), total
+    return frames.astype(np.uint8, copy=False), total, idx
 
 
 def load_dense_jepa_encoder(pt_model_path=None):
@@ -269,7 +269,7 @@ def main():
                 skipped += 1
                 continue
 
-            frames, total_frames = read_video_clip(
+            frames, total_frames, frame_indices = read_video_clip(
                 video_path, num_frames=args.num_frames, decode_size=args.decode_size
             )
             video = preprocess_vjepa_video(frames)
@@ -282,6 +282,7 @@ def main():
             payload["video_path"] = np.asarray(str(video_path))
             payload["nframes_used"] = np.asarray(int(args.num_frames), dtype=np.int32)
             payload["total_frames"] = np.asarray(int(total_frames), dtype=np.int32)
+            payload["frame_indices"] = np.asarray(frame_indices, dtype=np.int64)
             payload.update(dummy_geometry(int(args.num_frames)))
             write_npz_atomic(cache_path, payload, save_mode=args.save_mode)
             done += 1

@@ -1702,6 +1702,8 @@ class NpzCacheDataset(torch.utils.data.Dataset):
                 token_ids_np = z.get("token_ids", None)  # int32
                 layers_np = z.get("layers", None)  # int32
                 vjepa_np = z.get("vjepa_feats", None)  # [T,P,D]
+                nframes_used_np = z.get("nframes_used", None)
+                frame_indices_np = z.get("frame_indices", None)
 
                 # Supervision / geometry
                 xyz_cam_np = z.get("xyz_cam", None)
@@ -1745,6 +1747,13 @@ class NpzCacheDataset(torch.utils.data.Dataset):
 
         img_t = int(imgs_np.shape[0]) if hasattr(imgs_np, "shape") and len(imgs_np.shape) >= 1 else 0
         total_frames = self._to_int_scalar(total_frames_np)
+        nframes_used = self._to_int_scalar(nframes_used_np)
+        if frame_indices_np is not None:
+            frame_indices = np.asarray(frame_indices_np, dtype=np.int64).reshape(-1)
+        elif total_frames is not None and total_frames > 0 and img_t > 0:
+            frame_indices = np.linspace(0, total_frames - 1, num=img_t, dtype=np.int64)
+        else:
+            frame_indices = np.arange(max(img_t, 0), dtype=np.int64)
         hdf5_path_hint = _scalar_to_string(hdf5_path_hint_np)
         video_path_hint = _scalar_to_string(video_path_hint_np)
         has_egoexo_extract = self._has_egoexo_extraction_fields(
@@ -2045,6 +2054,15 @@ class NpzCacheDataset(torch.utils.data.Dataset):
             "token_ids": token_ids,  # int32
             "layers": layers,  # int32
             "vjepa_feats": vjepa_feats,  # [T,P,D]
+            "frame_indices": torch.from_numpy(frame_indices).to(torch.int64).contiguous(),
+            "total_frames": torch.tensor(
+                int(total_frames) if total_frames is not None else -1,
+                dtype=torch.int32,
+            ),
+            "nframes_used": torch.tensor(
+                int(nframes_used) if nframes_used is not None else int(img_t),
+                dtype=torch.int32,
+            ),
         }
 
         tup = (

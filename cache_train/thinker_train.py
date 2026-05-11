@@ -746,6 +746,26 @@ def load_frame_gt_for_paths(paths, frame_gt_index: dict, frame_gt_cache: dict):
     return labels
 
 
+def align_frame_gt_to_latent_frames(frame_gt, latent_len: int, frame_indices=None):
+    labels = (np.asarray(frame_gt).reshape(-1) > 0).astype(np.int32)
+    latent_len = int(latent_len)
+    if latent_len <= 0 or labels.size <= 0:
+        return np.zeros((0,), dtype=np.int32)
+
+    if frame_indices is not None:
+        idx = np.asarray(frame_indices).reshape(-1)
+        if idx.size >= latent_len:
+            idx = idx[:latent_len].astype(np.int64, copy=False)
+            if idx.size > 0 and idx.min() >= 0 and idx.max() < labels.size:
+                return labels[idx]
+
+    if labels.size == latent_len:
+        return labels
+
+    idx = np.linspace(0, labels.size - 1, num=latent_len, dtype=np.int64)
+    return labels[idx]
+
+
 def resolve_cache_preload_policy(args) -> bool:
     explicit = getattr(args, "preload_cache_to_memory", None)
     if explicit is not None:
@@ -3398,10 +3418,33 @@ def main(args):
                         frame_gt_batch = load_frame_gt_for_paths(
                             paths, frame_gt_index, frame_gt_cache
                         )
+                        frame_indices_batch = (
+                            extras.get("frame_indices", None)
+                            if isinstance(extras, dict)
+                            else None
+                        )
                         for sample_idx, frame_gt in enumerate(frame_gt_batch[:B]):
                             if frame_gt is None:
                                 continue
-                            valid_len = min(int(Tall), int(frame_gt.shape[0]))
+                            frame_indices_sample = None
+                            if isinstance(frame_indices_batch, torch.Tensor):
+                                if frame_indices_batch.dim() >= 2 and sample_idx < frame_indices_batch.size(0):
+                                    frame_indices_sample = (
+                                        frame_indices_batch[sample_idx]
+                                        .detach()
+                                        .cpu()
+                                        .numpy()
+                                    )
+                                elif frame_indices_batch.dim() == 1:
+                                    frame_indices_sample = (
+                                        frame_indices_batch.detach().cpu().numpy()
+                                    )
+                            labels_latent = align_frame_gt_to_latent_frames(
+                                frame_gt,
+                                latent_len=int(Tall),
+                                frame_indices=frame_indices_sample,
+                            )
+                            valid_len = min(int(Tall), int(labels_latent.shape[0]))
                             if valid_len <= 0:
                                 continue
                             mask_np = (
@@ -3420,7 +3463,7 @@ def main(args):
                                 .numpy()
                             )
                             val_frame_auc_scores.extend(score_np[mask_np].tolist())
-                            val_frame_auc_labels.extend(frame_gt[:valid_len][mask_np].tolist())
+                            val_frame_auc_labels.extend(labels_latent[:valid_len][mask_np].tolist())
 
                     test_loss_sum += float(pred_metrics_eval["pred_loss"].item())
                     test_acc_sum += float((1.0 - anomaly_rate).item())
