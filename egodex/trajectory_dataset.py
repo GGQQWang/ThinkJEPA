@@ -677,6 +677,7 @@ def build_egodex_dataloaders(
     # NPZ cache pipeline
     use_npz_cache=False,
     cache_dir=None,
+    test_cache_dir=None,
     shards=None,
     shards_id=0,
     # Unified abt split for both HDF5 and NPZ; NPZ ignores t
@@ -722,11 +723,13 @@ def build_egodex_dataloaders(
         dataset_roots = _expand_roots_for_sidecar_lookup(dataset_path)
 
         if use_npz_cache:
+            train_cache_dir = cache_dir
+            eval_cache_dir = test_cache_dir or cache_dir
             train_files = _rewrite_manifest_paths_to_cache_archives(
-                train_files, dataset_path=dataset_path, cache_dir=cache_dir
+                train_files, dataset_path=dataset_path, cache_dir=train_cache_dir
             )
             test_files = _rewrite_manifest_paths_to_cache_archives(
-                test_files, dataset_path=dataset_path, cache_dir=cache_dir
+                test_files, dataset_path=dataset_path, cache_dir=eval_cache_dir
             )
             train_ds = NpzCacheDataset(
                 train_files,
@@ -737,7 +740,7 @@ def build_egodex_dataloaders(
                 pad_new_to=pad_new_to,
                 pad_value=pad_value,
                 data_roots=dataset_roots,
-                cache_root=cache_dir,
+                cache_root=train_cache_dir,
             )
             test_ds = NpzCacheDataset(
                 test_files,
@@ -748,7 +751,7 @@ def build_egodex_dataloaders(
                 pad_new_to=pad_new_to,
                 pad_value=pad_value,
                 data_roots=dataset_roots,
-                cache_root=cache_dir,
+                cache_root=eval_cache_dir,
             )
         else:
             train_ds = SimpleDataset(

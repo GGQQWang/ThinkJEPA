@@ -2090,6 +2090,8 @@ def main(args):
     args.data_dir = resolve_egodex_data_reference(str(args.data_dir))
     if getattr(args, "cache_dir", None):
         args.cache_dir = resolve_egodex_data_reference(str(args.cache_dir))
+    if getattr(args, "test_cache_dir", None):
+        args.test_cache_dir = resolve_egodex_data_reference(str(args.test_cache_dir))
     args.preload_cache_to_memory = resolve_cache_preload_policy(args)
 
     ddp = bool(getattr(args, "ddp", False))
@@ -2147,6 +2149,7 @@ def main(args):
         test_manifest=getattr(args, "test_manifest", None),
         use_npz_cache=bool(getattr(args, "use_npz_cache", False)),
         cache_dir=getattr(args, "cache_dir", None),
+        test_cache_dir=getattr(args, "test_cache_dir", None),
         shards=getattr(args, "shards", None) if hasattr(args, "shards") else None,
         shards_id=(
             int(getattr(args, "shards_id", 0)) if hasattr(args, "shards_id") else 0
@@ -4068,6 +4071,12 @@ if __name__ == "__main__":
         type=str,
         default=DEFAULT_EGODEX_PART2_HF_DIR,
         help="root directory of the NPZ cache (should match your extraction output; V-JEPA only)",
+    )
+    parser.add_argument(
+        "--test_cache_dir",
+        type=str,
+        default=None,
+        help="optional root directory of the test NPZ cache; defaults to --cache_dir",
     )
     parser.add_argument(
         "--preload_cache_to_memory",
