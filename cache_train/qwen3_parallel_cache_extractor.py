@@ -109,7 +109,7 @@ def parse_parallel_thinker_cache_args():
         default=int(os.environ.get("QWEN3VL_MAX_PENDING_WRITES", "20")),
         help="Backpressure limit for async writes.",
     )
-    return p.parse_parallel_thinker_cache_args()
+    return p.parse_args()
 
 
 def tensor_to_cache_numpy(x: torch.Tensor, save_dtype: str) -> np.ndarray:

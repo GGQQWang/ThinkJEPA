@@ -39,8 +39,12 @@ for _path in (
     if _path_str not in sys.path:
         sys.path.insert(0, _path_str)
 
-import vjepa2.src.datasets.utils.video.transforms as video_transforms
-import vjepa2.src.datasets.utils.video.volume_transforms as volume_transforms
+try:
+    import vjepa2.src.datasets.utils.video.transforms as video_transforms
+    import vjepa2.src.datasets.utils.video.volume_transforms as volume_transforms
+except ModuleNotFoundError:
+    video_transforms = None
+    volume_transforms = None
 
 from cache_train.models import (
     TrajectoryReadoutMLP,
@@ -556,6 +560,12 @@ def load_pretrained_dense_jepa_weights(model, pretrained_weights):
 
 
 def build_dense_jepa_video_transform(img_size):
+    if video_transforms is None or volume_transforms is None:
+        raise ModuleNotFoundError(
+            "Could not import vjepa2.src.datasets video transforms. "
+            "Use --skip_vjepa with cached vjepa_feats, or install the V-JEPA2 "
+            "source tree that includes vjepa2/src/datasets."
+        )
     short_side_size = int(256.0 / 224 * img_size)
     eval_transform = video_transforms.Compose(
         [
