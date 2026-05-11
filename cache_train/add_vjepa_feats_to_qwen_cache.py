@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from decord import VideoReader, cpu
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -27,16 +28,15 @@ for _path in (
     if _path_str not in sys.path:
         sys.path.insert(0, _path_str)
 
-from cache_train.thinker_train import (  # noqa: E402
-    VideoObservationAdapter,
-    encode_dense_jepa_video,
-    load_dense_jepa_encoder,
-)
+from cache_train.checkpoint_paths import resolve_dense_jepa_checkpoint  # noqa: E402
+from vjepa2.src.models.vision_transformer import vit_large_rope  # noqa: E402
 
 
 _QWEN_CACHE_NAME_RE = re.compile(
     r"^(?P<stem>.+?)_L\d+_nf\d+_res\d+_new\d+_s\d+of\d+$"
 )
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def parse_args():
@@ -129,6 +129,64 @@ def read_video_clip(video_path: str, num_frames: int, decode_size: int):
     return frames.astype(np.uint8, copy=False), total
 
 
+def load_dense_jepa_encoder(pt_model_path=None):
+    if pt_model_path is None:
+        pt_model_path = resolve_dense_jepa_checkpoint()
+    model_pt = vit_large_rope(img_size=(256, 256), num_frames=64)
+    model_pt.cuda().eval()
+    checkpoint = torch.load(pt_model_path, weights_only=True, map_location="cpu")
+    state = checkpoint["encoder"] if isinstance(checkpoint, dict) and "encoder" in checkpoint else checkpoint
+    state = {k.replace("module.", "").replace("backbone.", ""): v for k, v in state.items()}
+    msg = model_pt.load_state_dict(state, strict=False)
+    print(f"[INFO] V-JEPA weights loaded from {pt_model_path}: {msg}", flush=True)
+    return model_pt
+
+
+def preprocess_vjepa_video(frames: np.ndarray):
+    video = torch.from_numpy(frames).cuda(non_blocking=True)
+    if video.ndim != 4:
+        raise ValueError(f"Expected [T,H,W,C] frames, got {tuple(video.shape)}")
+    if video.shape[-1] == 4:
+        video = video[..., :3]
+    video = video.float()
+    if video.max() > 1.0:
+        video = video / 255.0
+    # [T,H,W,C] -> [1,T,C,H,W]
+    video = video.permute(0, 3, 1, 2).unsqueeze(0).contiguous()
+    B, T, C, H, W = video.shape
+    frames_flat = video.view(B * T, C, H, W)
+    short_side = int(256.0 / 224 * 256)
+    if H <= W:
+        new_h = short_side
+        new_w = int(round(W * (short_side / H)))
+    else:
+        new_h = int(round(H * (short_side / W)))
+        new_w = short_side
+    frames_flat = F.interpolate(
+        frames_flat,
+        size=(new_h, new_w),
+        mode="bilinear",
+        align_corners=False,
+        antialias=False,
+    )
+    top = max(0, int(round((new_h - 256) / 2.0)))
+    left = max(0, int(round((new_w - 256) / 2.0)))
+    frames_flat = frames_flat[:, :, top : top + 256, left : left + 256]
+    mean = torch.tensor(_IMAGENET_MEAN, device=frames_flat.device, dtype=torch.float32)[None, :, None, None]
+    std = torch.tensor(_IMAGENET_STD, device=frames_flat.device, dtype=torch.float32)[None, :, None, None]
+    frames_flat = (frames_flat - mean) / std
+    return frames_flat.view(B, T, C, 256, 256).contiguous()
+
+
+def encode_dense_jepa_video(video, model_pt):
+    with torch.no_grad():
+        B, T, C, H, W = video.shape
+        video = video.permute(0, 2, 1, 3, 4)
+        out = model_pt(video)
+        out = out.contiguous().view(B, T, -1, out.shape[-1])
+    return out
+
+
 def to_cache_dtype(x: torch.Tensor, save_dtype: str):
     if save_dtype == "fp16":
         return x.detach().float().half().cpu().numpy()
@@ -188,10 +246,9 @@ def main():
     if not by_rel_and_stem:
         raise ValueError(f"No .npz cache files found under: {args.cache_dir}")
 
-    model_pt, pt_video_transform = load_dense_jepa_encoder()
+    model_pt = load_dense_jepa_encoder()
     for p in model_pt.parameters():
         p.requires_grad_(False)
-    fast_tx = VideoObservationAdapter(pt_video_transform, antialias=False).cuda()
 
     done = skipped = missing = failed = 0
     for i, video_path in enumerate(videos, start=1):
@@ -215,10 +272,7 @@ def main():
             frames, total_frames = read_video_clip(
                 video_path, num_frames=args.num_frames, decode_size=args.decode_size
             )
-            video = torch.from_numpy(frames).cuda(non_blocking=True)
-            video = fast_tx(video)
-            if video.ndim == 4:
-                video = video.unsqueeze(0)
+            video = preprocess_vjepa_video(frames)
             with torch.no_grad():
                 feats = encode_dense_jepa_video(video, model_pt)[0].contiguous()
 
