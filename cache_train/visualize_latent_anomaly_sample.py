@@ -203,7 +203,8 @@ def main():
     score_count = torch.zeros((Tall,), device=device)
     windows = build_sliding_latent_windows(Tall, args.past_T, args.future_T, args.anomaly_stride)
     with torch.no_grad():
-        for p0, p1, f0, f1 in windows:
+        for window in windows:
+            (p0, p1), (f0, f1) = window
             pred, target = predict_window(predictor, feats, extras, p0, p1, f0, f1, args)
             scores, _ = compute_latent_anomaly_scores(pred, target, args.anomaly_threshold)
             score_sum[f0:f1] += scores[0]
